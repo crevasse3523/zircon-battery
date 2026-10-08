@@ -1,0 +1,2 @@
+# Genesis Zircon 660 Pro (dongle Telink 331a:502e) — dostęp do hidraw dla zircon-battery
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="331a", ATTRS{idProduct}=="502e", MODE="0660", GROUP="plugdev", TAG+="uaccess"

@@ -1,0 +1,15 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [{ "Name": "crevasse3523" }],
+        "Category": "System Information",
+        "Description": "Stan baterii myszy Genesis Zircon 660 Pro (2.4 GHz)",
+        "EnabledByDefault": true,
+        "Icon": "input-mouse",
+        "Id": "org.crevasse3523.zirconbattery",
+        "License": "GPL-2.0+",
+        "Name": "Zircon Battery",
+        "Version": "1.0"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

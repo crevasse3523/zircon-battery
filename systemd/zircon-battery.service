@@ -1,0 +1,11 @@
+[Unit]
+Description=Stan baterii myszy Genesis Zircon 660 Pro (dla plasmoidu Zircon Battery)
+
+[Service]
+ExecStart=%h/.local/bin/zircon-battery
+Restart=on-failure
+RestartSec=30
+Nice=10
+
+[Install]
+WantedBy=default.target

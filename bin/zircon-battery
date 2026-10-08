@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Stan baterii myszy Genesis Zircon 660 Pro (dongle 2.4 GHz, 331a:502e).
+
+Protokół (podpatrzony z programu Genesis na Windowsie):
+  zapytanie: report 0x05, bajty 24 fa 48 + zera (33 B)
+  odpowiedź: 05 ?? fa 48 ..., bajt[6] = ładowanie (1/0), bajt[9] = bateria %,
+             bajty 4-5 LE x4 ~ napięcie w mV (hipoteza)
+  Echo zapytania ma zera w bajtach 4-7 i jest pomijane.
+
+Oszczędzanie baterii myszy i CPU:
+  - zapytanie idzie tylko wtedy, gdy mysz i tak nadaje (po pierwszym raporcie ruchu),
+    więc uśpiona mysz nigdy nie jest budzona;
+  - czekanie na ruch to select() w jądrze: zero wybudzeń, dopóki mysz leży;
+  - hidraw jest zamykany zaraz po odczycie, a ciągły strumień ruchu (do 1000 Hz)
+    nie trafia do procesu; między odczytami demon śpi 15 min (5 min przy ładowaniu).
+
+Użycie:
+  zircon-battery            demon, stan w $XDG_RUNTIME_DIR/zircon-battery.json
+  zircon-battery --once     jedno zapytanie od razu, JSON na stdout
+  zircon-battery -v         demon z logiem diagnostycznym
+"""
+import json
+import os
+import select
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HID_ID = "0000331A:0000502E"
+QUERY = bytes([0x05, 0x24, 0xFA, 0x48]) + bytes(29)
+INTERVAL = 15 * 60
+INTERVAL_CHARGING = 5 * 60
+RETRY_NO_DONGLE = 60
+ACTIVITY_WAIT = 30 * 60  # po tym czasie bez ruchu tylko odświeżamy plik stanu
+LOW_PCT = 15
+
+STATE = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "zircon-battery.json"
+VERBOSE = "-v" in sys.argv
+
+
+def log(*a):
+    if VERBOSE:
+        print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
+
+
+def find_hidraw():
+    """Ścieżka /dev/hidrawN interfejsu z raportem 0x05 (numer zmienia się po replug)."""
+    for node in sorted(Path("/sys/class/hidraw").glob("hidraw*")):
+        dev = node / "device"
+        try:
+            if HID_ID not in (dev / "uevent").read_text():
+                continue
+            if b"\x85\x05" not in (dev / "report_descriptor").read_bytes():
+                continue
+        except OSError:
+            continue
+        return f"/dev/{node.name}"
+    return None
+
+
+def drain(fd):
+    while select.select([fd], [], [], 0)[0]:
+        os.read(fd, 64)
+
+
+def query(fd, timeout=1.0):
+    drain(fd)
+    os.write(fd, QUERY)
+    deadline = time.monotonic() + timeout
+    while (left := deadline - time.monotonic()) > 0:
+        if not select.select([fd], [], [], left)[0]:
+            break
+        d = os.read(fd, 64)
+        if len(d) >= 10 and d[0] == 0x05 and d[2:4] == b"\xfa\x48" and any(d[4:8]):
+            return {
+                "percent": d[9],
+                "charging": bool(d[6]),
+                "mv": int.from_bytes(d[4:6], "little") * 4,
+                "raw": d.hex(),
+            }
+    return None
+
+
+def write_state(state):
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state))
+    os.replace(tmp, STATE)
+
+
+def notify(text):
+    try:
+        subprocess.run(["notify-send", "-a", "Zircon Battery", "-i", "input-mouse",
+                        "-u", "critical", "Słaba bateria myszy", text], timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def once():
+    path = find_hidraw()
+    if not path:
+        print(json.dumps({"online": False, "error": "brak dongla"}))
+        return 1
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError as e:
+        print(json.dumps({"online": False, "error": f"{path}: {e.strerror}"}))
+        return 1
+    try:
+        r = query(fd)
+    finally:
+        os.close(fd)
+    print(json.dumps({"online": r is not None, **(r or {})}))
+    return 0 if r else 1
+
+
+def daemon():
+    state = {"online": False}
+    try:
+        state = json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        pass
+    warned = False
+    while True:
+        state["checked"] = int(time.time())
+        path = find_hidraw()
+        if not path:
+            log("brak dongla")
+            state["online"] = False
+            state["dongle"] = False
+            write_state(state)
+            time.sleep(RETRY_NO_DONGLE)
+            continue
+        state["dongle"] = True
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except OSError as e:
+            log("open", path, e)
+            write_state(state)
+            time.sleep(RETRY_NO_DONGLE)
+            continue
+        try:
+            log("czekam na ruch myszy", path)
+            if not select.select([fd], [], [], ACTIVITY_WAIT)[0]:
+                log("brak ruchu, bez zapytania")
+                write_state(state)
+                continue
+            os.read(fd, 64)
+            r = query(fd)
+        except OSError as e:  # dongle wyjęty w trakcie
+            log("hidraw", e)
+            r = None
+        finally:
+            os.close(fd)
+
+        if r:
+            log("odczyt", r)
+            state.update(r, online=True, ts=int(time.time()))
+            if r["charging"] or r["percent"] > LOW_PCT + 5:
+                warned = False
+            elif r["percent"] <= LOW_PCT and not warned:
+                notify(f"Zircon 660 Pro: {r['percent']}% — podłącz kabel.")
+                warned = True
+        else:
+            log("brak odpowiedzi")
+            state["online"] = False
+        write_state(state)
+        time.sleep(INTERVAL_CHARGING if state.get("charging") else INTERVAL)
+
+
+if __name__ == "__main__":
+    if "--once" in sys.argv:
+        sys.exit(once())
+    try:
+        daemon()
+    except KeyboardInterrupt:
+        pass
