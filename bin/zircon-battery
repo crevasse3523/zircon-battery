@@ -96,21 +96,37 @@ def notify(text):
         pass
 
 
-def once():
+def read_battery(wait=None):
+    """Jeden odczyt: (wynik | None, status, błąd).
+
+    Status: ok, no_dongle, open_error, io_error, idle, no_reply. Z `wait` zapytanie
+    idzie dopiero po raporcie ruchu, a bez ruchu przez `wait` sekund wynikiem jest idle.
+    """
     path = find_hidraw()
     if not path:
-        print(json.dumps({"online": False, "error": "brak dongla"}))
-        return 1
+        return None, "no_dongle", "brak dongla"
     try:
         fd = os.open(path, os.O_RDWR)
     except OSError as e:
-        print(json.dumps({"online": False, "error": f"{path}: {e.strerror}"}))
-        return 1
+        return None, "open_error", f"{path}: {e.strerror}"
     try:
+        if wait is not None:
+            log("czekam na ruch myszy", path)
+            if not select.select([fd], [], [], wait)[0]:
+                return None, "idle", "brak ruchu"
         r = query(fd)
+    except OSError as e:  # dongle wyjęty w trakcie
+        return None, "io_error", f"{path}: {e.strerror}"
     finally:
         os.close(fd)
-    print(json.dumps({"online": r is not None, **(r or {})}))
+    if r is None:
+        return None, "no_reply", "brak odpowiedzi"
+    return r, "ok", None
+
+
+def once():
+    r, _, err = read_battery()
+    print(json.dumps({"online": True, **r} if r else {"online": False, "error": err}))
     return 0 if r else 1
 
 
@@ -122,50 +138,25 @@ def daemon():
         pass
     warned = False
     while True:
+        r, status, err = read_battery(wait=ACTIVITY_WAIT)
         state["checked"] = int(time.time())
-        path = find_hidraw()
-        if not path:
-            log("brak dongla")
-            state["online"] = False
-            state["dongle"] = False
-            write_state(state)
-            time.sleep(RETRY_NO_DONGLE)
-            continue
-        state["dongle"] = True
-        try:
-            fd = os.open(path, os.O_RDWR)
-        except OSError as e:
-            log("open", path, e)
-            write_state(state)
-            time.sleep(RETRY_NO_DONGLE)
-            continue
-        try:
-            log("czekam na ruch myszy", path)
-            if not select.select([fd], [], [], ACTIVITY_WAIT)[0]:
-                log("brak ruchu, bez zapytania")
-                write_state(state)
-                continue
-            os.read(fd, 64)
-            r = query(fd)
-        except OSError as e:  # dongle wyjęty w trakcie
-            log("hidraw", e)
-            r = None
-        finally:
-            os.close(fd)
-
+        state["dongle"] = status not in ("no_dongle", "io_error")
         if r:
             log("odczyt", r)
-            state.update(r, online=True, ts=int(time.time()))
+            state.update(r, online=True, ts=state["checked"])
             if r["charging"] or r["percent"] > LOW_PCT + 5:
                 warned = False
             elif r["percent"] <= LOW_PCT and not warned:
                 notify(f"Zircon 660 Pro: {r['percent']}% — podłącz kabel.")
                 warned = True
+            delay = INTERVAL_CHARGING if r["charging"] else INTERVAL
         else:
-            log("brak odpowiedzi")
-            state["online"] = False
+            log(err)
+            state.update(online=False, charging=False)
+            # idle od razu wraca do czekania na ruch; błędy dongla ponawiamy po minucie
+            delay = {"idle": 0, "no_reply": INTERVAL}.get(status, RETRY_NO_DONGLE)
         write_state(state)
-        time.sleep(INTERVAL_CHARGING if state.get("charging") else INTERVAL)
+        time.sleep(delay)
 
 
 if __name__ == "__main__":

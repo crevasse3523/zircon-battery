@@ -20,16 +20,18 @@ PlasmoidItem {
 
     readonly property bool hasValue: batt.percent !== undefined
     readonly property int percent: hasValue ? batt.percent : 0
-    readonly property bool charging: hasValue && !!batt.charging
     readonly property bool online: hasValue && !!batt.online
+    readonly property bool charging: hasValue && !!batt.charging
+    readonly property bool low: hasValue && !charging && percent < 20
+    readonly property real dimOpacity: online ? 1 : 0.5
 
     // zielony od 50%, płynnie do pomarańczowego przy 20%, poniżej czerwony
     readonly property color levelColor: {
         if (!hasValue) return Kirigami.Theme.disabledTextColor
+        if (low) return Kirigami.Theme.negativeTextColor
         if (charging || percent >= 50) return Kirigami.Theme.positiveTextColor
-        if (percent >= 20) return Kirigami.ColorUtils.linearInterpolation(
+        return Kirigami.ColorUtils.linearInterpolation(
             Kirigami.Theme.neutralTextColor, Kirigami.Theme.positiveTextColor, (percent - 20) / 30)
-        return Kirigami.Theme.negativeTextColor
     }
 
     readonly property string statusText: {
@@ -62,8 +64,15 @@ PlasmoidItem {
         }
     }
 
+    component MouseIcon: Kirigami.Icon {
+        source: "input-mouse"
+        opacity: root.dimOpacity
+    }
+
     component LevelBar: Rectangle {
         id: bar
+        // animacja tylko, gdy okno paska jest na ekranie (zamknięty popup nie animuje w tle)
+        readonly property bool animated: root.charging && Window.visibility !== Window.Hidden
         radius: height / 2
         color: Kirigami.ColorUtils.linearInterpolation(
             Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor, 0.12)
@@ -85,21 +94,24 @@ PlasmoidItem {
             // połysk przesuwający się po pasku w trakcie ładowania
             Rectangle {
                 id: shine
-                visible: root.charging
+                visible: bar.animated
                 width: fill.width * 0.35
                 height: parent.height
                 radius: bar.radius
+                // x liczony z fazy 0..1, więc połysk nadąża za zmianą szerokości paska w trakcie animacji
+                property real phase
+                x: -width + phase * (fill.width + width)
                 gradient: Gradient {
                     orientation: Gradient.Horizontal
                     GradientStop { position: 0; color: "transparent" }
                     GradientStop { position: 0.5; color: Qt.rgba(1, 1, 1, 0.35) }
                     GradientStop { position: 1; color: "transparent" }
                 }
-                NumberAnimation on x {
-                    running: root.charging
+                NumberAnimation on phase {
+                    running: bar.animated
                     loops: Animation.Infinite
-                    from: -shine.width
-                    to: fill.width
+                    from: 0
+                    to: 1
                     duration: 1800
                     easing.type: Easing.InOutSine
                 }
@@ -111,12 +123,10 @@ PlasmoidItem {
         Layout.minimumWidth: Kirigami.Units.iconSizes.medium
         onClicked: root.expanded = !root.expanded
 
-        Kirigami.Icon {
+        MouseIcon {
             anchors { top: parent.top; horizontalCenter: parent.horizontalCenter }
             width: Math.min(parent.width, parent.height) * 0.75
             height: width
-            source: "input-mouse"
-            opacity: root.online ? 1 : 0.5
         }
         LevelBar {
             anchors { left: parent.left; right: parent.right; bottom: parent.bottom; margins: 1 }
@@ -128,7 +138,7 @@ PlasmoidItem {
         Layout.minimumWidth: Kirigami.Units.gridUnit * 8
         Layout.minimumHeight: Kirigami.Units.gridUnit * 4
         Layout.preferredWidth: Kirigami.Units.gridUnit * 12
-        Layout.preferredHeight: Kirigami.Units.gridUnit * 6
+        Layout.preferredHeight: Kirigami.Units.gridUnit * 7.5
         spacing: Kirigami.Units.smallSpacing
 
         Kirigami.Heading {
@@ -144,25 +154,22 @@ PlasmoidItem {
             Layout.fillWidth: true
             spacing: Kirigami.Units.largeSpacing
 
-            Kirigami.Icon {
+            MouseIcon {
                 Layout.preferredWidth: Kirigami.Units.iconSizes.large
                 Layout.preferredHeight: Kirigami.Units.iconSizes.large
-                source: "input-mouse"
-                opacity: root.online ? 1 : 0.45
             }
 
             RowLayout {
                 Layout.alignment: Qt.AlignVCenter
                 spacing: Kirigami.Units.smallSpacing / 2
-                opacity: root.online ? 1 : 0.55
+                opacity: root.dimOpacity
 
                 QQC2.Label {
                     Layout.alignment: Qt.AlignBaseline
                     text: root.hasValue ? root.percent : "—"
                     font.pointSize: Kirigami.Theme.defaultFont.pointSize * 2.4
                     font.weight: Font.Light
-                    color: root.percent < 20 && root.hasValue && !root.charging
-                           ? root.levelColor : Kirigami.Theme.textColor
+                    color: root.low ? root.levelColor : Kirigami.Theme.textColor
                 }
                 QQC2.Label {
                     Layout.alignment: Qt.AlignBaseline
@@ -181,15 +188,12 @@ PlasmoidItem {
                 Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium
                 Layout.preferredHeight: Kirigami.Units.iconSizes.medium
                 visible: root.charging
-                antialiasing: true
-                layer.enabled: true
-                layer.samples: 4
+                preferredRendererType: Shape.CurveRenderer
 
                 ShapePath {
                     strokeWidth: 0
                     strokeColor: "transparent"
                     fillColor: Kirigami.Theme.positiveTextColor
-                    startX: bolt.width * 10 / 16; startY: 0
                     PathPolyline {
                         readonly property real sx: bolt.width / 16
                         readonly property real sy: bolt.height / 24
@@ -200,7 +204,7 @@ PlasmoidItem {
                 }
 
                 SequentialAnimation on opacity {
-                    running: root.charging
+                    running: root.charging && bolt.Window.visibility !== Window.Hidden
                     loops: Animation.Infinite
                     NumberAnimation { to: 0.35; duration: 1100; easing.type: Easing.InOutSine }
                     NumberAnimation { to: 1; duration: 1100; easing.type: Easing.InOutSine }

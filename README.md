@@ -29,6 +29,7 @@ Bajt[1] odpowiedzi jest zmienny. Echo zapytania ma zera w bajtach 4–7 i jest p
 - Czekanie na ruch to `select()` w jądrze, bez wybudzeń procesu.
 - Hidraw jest zamykany zaraz po odczycie. Między odczytami demon śpi 15 min, a przy ładowaniu 5 min.
 - Raz wysyła powiadomienie przy ≤ 15%.
+- Po 30 min bez ruchu mysz jest oznaczana jako uśpiona (widget pokazuje ostatni znany procent).
 
 ## Instalacja
 
