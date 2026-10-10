@@ -3,8 +3,9 @@
 
 Protokół (podpatrzony z programu Genesis na Windowsie):
   zapytanie: report 0x05, bajty 24 fa 48 + zera (33 B)
-  odpowiedź: 05 ?? fa 48 ..., bajt[6] = ładowanie (1/0), bajt[9] = bateria %,
-             bajty 4-5 LE x4 ~ napięcie w mV (hipoteza)
+  odpowiedź: 05 ?? fa 48 ..., bajty 4-5 LE x4 = napięcie w mV, bajt[6] = ładowanie (1/0)
+  Bajty 8-10 (31 50 07) są stałe, więc to nie bateria. Procent liczymy z napięcia
+  krzywą skalibrowaną do odczytu z BLE Battery Service tej myszy (3750 mV ~ 64%).
   Echo zapytania ma zera w bajtach 4-7 i jest pomijane.
 
 Oszczędzanie baterii myszy i CPU:
@@ -34,6 +35,9 @@ INTERVAL_CHARGING = 5 * 60
 RETRY_NO_DONGLE = 60
 ACTIVITY_WAIT = 30 * 60  # po tym czasie bez ruchu tylko odświeżamy plik stanu
 LOW_PCT = 15
+# (mV, %) krzywa rozładowania Li-Po pod obciążeniem; punkt 3750/64 zmierzony przez BT
+MV_CURVE = [(3400, 0), (3500, 10), (3600, 28), (3650, 42), (3700, 55), (3750, 64),
+            (3800, 70), (3900, 79), (4000, 88), (4150, 100)]
 
 STATE = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "zircon-battery.json"
 VERBOSE = "-v" in sys.argv
@@ -64,6 +68,15 @@ def drain(fd):
         os.read(fd, 64)
 
 
+def percent_from_mv(mv):
+    if mv <= MV_CURVE[0][0]:
+        return 0
+    for (v0, p0), (v1, p1) in zip(MV_CURVE, MV_CURVE[1:]):
+        if mv <= v1:
+            return round(p0 + (p1 - p0) * (mv - v0) / (v1 - v0))
+    return 100
+
+
 def query(fd, timeout=1.0):
     drain(fd)
     os.write(fd, QUERY)
@@ -73,10 +86,11 @@ def query(fd, timeout=1.0):
             break
         d = os.read(fd, 64)
         if len(d) >= 10 and d[0] == 0x05 and d[2:4] == b"\xfa\x48" and any(d[4:8]):
+            mv = int.from_bytes(d[4:6], "little") * 4
             return {
-                "percent": d[9],
+                "percent": percent_from_mv(mv),
                 "charging": bool(d[6]),
-                "mv": int.from_bytes(d[4:6], "little") * 4,
+                "mv": mv,
                 "raw": d.hex(),
             }
     return None

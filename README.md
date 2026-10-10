@@ -10,11 +10,11 @@ Mysz nie zgłasza baterii standardowym polem HID, więc jądro, UPower i KDE jej
 |---|---|
 | zapytanie (33 B, output report) | `05 24 fa 48` + 29× `00` |
 | odpowiedź | `05 ?? fa 48 …` |
-| bateria % | bajt[9] |
+| napięcie | bajty 4–5 LE × 4 = mV |
 | ładowanie | bajt[6] (1/0) |
-| napięcie (hipoteza) | bajty 4–5 LE × 4 = mV |
+| stałe `31 50 07` (nie bateria) | bajty 8–10 |
 
-Bajt[1] odpowiedzi jest zmienny. Echo zapytania ma zera w bajtach 4–7 i jest pomijane. Na Linuksie kanał vendor dzieli `/dev/hidrawN` z raportami ruchu myszy.
+Mysz po 2.4 GHz nie podaje procentu, tylko napięcie. Demon przelicza je krzywą Li-Po skalibrowaną do odczytu z Bluetooth (BLE Battery Service: 3750 mV ≈ 64%). Bajt[1] odpowiedzi jest zmienny. Echo zapytania ma zera w bajtach 4–7 i jest pomijane. Na Linuksie kanał vendor dzieli `/dev/hidrawN` z raportami ruchu myszy.
 
 ## Elementy
 
