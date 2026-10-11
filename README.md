@@ -1,6 +1,6 @@
 # zircon-battery
 
-Stan baterii myszy **Genesis Zircon 660 Pro** (odbiornik 2.4 GHz, Telink `331a:502e`) na pulpicie KDE Plasma 6.
+Stan baterii myszy **Genesis Zircon 660 Pro** (odbiornik 2.4 GHz, Telink `331a:502e`, albo kabel USB `331a:5031`) na pulpicie KDE Plasma 6.
 
 Mysz nie zgłasza baterii standardowym polem HID, więc jądro, UPower i KDE jej nie widzą. Bateria jest dostępna tylko przez kanał producenta (report ID 5), z którego korzysta program Genesis na Windowsie.
 

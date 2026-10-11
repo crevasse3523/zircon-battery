@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stan baterii myszy Genesis Zircon 660 Pro (dongle 2.4 GHz, 331a:502e).
+"""Stan baterii myszy Genesis Zircon 660 Pro (dongle 2.4 GHz 331a:502e albo kabel 331a:5031).
 
 Protokół (podpatrzony z programu Genesis na Windowsie):
   zapytanie: report 0x05, bajty 24 fa 48 + zera (33 B)
@@ -28,7 +28,7 @@ import sys
 import time
 from pathlib import Path
 
-HID_ID = "0000331A:0000502E"
+HID_IDS = ("0000331A:0000502E", "0000331A:00005031")  # dongle 2.4 GHz, kabel USB
 QUERY = bytes([0x05, 0x24, 0xFA, 0x48]) + bytes(29)
 INTERVAL = 15 * 60
 INTERVAL_CHARGING = 5 * 60
@@ -48,19 +48,21 @@ def log(*a):
         print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
 
 
-def find_hidraw():
-    """Ścieżka /dev/hidrawN interfejsu z raportem 0x05 (numer zmienia się po replug)."""
+def find_hidraws():
+    """Ścieżki /dev/hidrawN interfejsów z raportem 0x05 (dongle i/lub kabel; numer zmienia się po replug)."""
+    paths = []
     for node in sorted(Path("/sys/class/hidraw").glob("hidraw*")):
         dev = node / "device"
         try:
-            if HID_ID not in (dev / "uevent").read_text():
+            uevent = (dev / "uevent").read_text()
+            if not any(i in uevent for i in HID_IDS):
                 continue
             if b"\x85\x05" not in (dev / "report_descriptor").read_bytes():
                 continue
         except OSError:
             continue
-        return f"/dev/{node.name}"
-    return None
+        paths.append(f"/dev/{node.name}")
+    return paths
 
 
 def drain(fd):
@@ -114,28 +116,38 @@ def read_battery(wait=None):
     """Jeden odczyt: (wynik | None, status, błąd).
 
     Status: ok, no_dongle, open_error, io_error, idle, no_reply. Z `wait` zapytanie
-    idzie dopiero po raporcie ruchu, a bez ruchu przez `wait` sekund wynikiem jest idle.
+    idzie dopiero po raporcie ruchu (przez urządzenie, które go zgłosiło), a bez ruchu
+    przez `wait` sekund wynikiem jest idle. Bez `wait` pytamy kolejno wszystkie.
     """
-    path = find_hidraw()
-    if not path:
+    paths = find_hidraws()
+    if not paths:
         return None, "no_dongle", "brak dongla"
+    fds, errors = {}, []
+    for path in paths:
+        try:
+            fds[os.open(path, os.O_RDWR)] = path
+        except OSError as e:
+            errors.append(f"{path}: {e.strerror}")
+    if not fds:
+        return None, "open_error", "; ".join(errors)
     try:
-        fd = os.open(path, os.O_RDWR)
-    except OSError as e:
-        return None, "open_error", f"{path}: {e.strerror}"
-    try:
-        if wait is not None:
-            log("czekam na ruch myszy", path)
-            if not select.select([fd], [], [], wait)[0]:
+        if wait is None:
+            ready = list(fds)
+        else:
+            log("czekam na ruch myszy", *fds.values())
+            ready = select.select(list(fds), [], [], wait)[0]
+            if not ready:
                 return None, "idle", "brak ruchu"
-        r = query(fd)
-    except OSError as e:  # dongle wyjęty w trakcie
-        return None, "io_error", f"{path}: {e.strerror}"
+        for fd in ready:
+            if r := query(fd):
+                log("odpowiedź z", fds[fd])
+                return r, "ok", None
+    except OSError as e:  # dongle albo kabel wyjęty w trakcie
+        return None, "io_error", str(e.strerror)
     finally:
-        os.close(fd)
-    if r is None:
-        return None, "no_reply", "brak odpowiedzi"
-    return r, "ok", None
+        for fd in fds:
+            os.close(fd)
+    return None, "no_reply", "brak odpowiedzi"
 
 
 def once():
@@ -150,6 +162,9 @@ def daemon():
         state = json.loads(STATE.read_text())
     except (OSError, ValueError):
         pass
+    # plik w /run znika przy restarcie: zapisujemy go od razu, bez budzenia myszy
+    state.update(online=False, charging=False, dongle=bool(find_hidraws()))
+    write_state(state)
     warned = False
     while True:
         r, status, err = read_battery(wait=ACTIVITY_WAIT)
