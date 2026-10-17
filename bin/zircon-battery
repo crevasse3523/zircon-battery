@@ -6,7 +6,12 @@ Protokół (podpatrzony z programu Genesis na Windowsie):
   odpowiedź: 05 ?? fa 48 ..., bajty 4-5 LE x4 = napięcie w mV, bajt[6] = ładowanie (1/0)
   Bajty 8-10 (31 50 07) są stałe, więc to nie bateria. Procent liczymy z napięcia
   krzywą skalibrowaną do odczytu z BLE Battery Service tej myszy (3750 mV ~ 64%).
-  Echo zapytania ma zera w bajtach 4-7 i jest pomijane.
+  Echo zapytania ma zera w bajtach 4-7 i jest pomijane. Mysz świeżo wybudzona
+  z głębokiego snu (~10 min bez ruchu) przez kilka sekund odpowiada samym echem,
+  a potem z opóźnieniem >1 s; dongle obsługuje tylko najnowsze zapytanie, więc
+  ponawiamy je co WAKE_REPLY sekund (nie częściej), WAKE_TRIES razy.
+  Po ~10 min bez ruchu dongle sam wysyła echo 05 24 fa 48 00..., którego nie
+  traktujemy jako ruchu.
 
 Oszczędzanie baterii myszy i CPU:
   - zapytanie idzie tylko wtedy, gdy mysz i tak nadaje (po pierwszym raporcie ruchu),
@@ -30,9 +35,12 @@ from pathlib import Path
 
 HID_IDS = ("0000331A:0000502E", "0000331A:00005031")  # dongle 2.4 GHz, kabel USB
 QUERY = bytes([0x05, 0x24, 0xFA, 0x48]) + bytes(29)
+REPORT_ID = QUERY[0]
 INTERVAL = 15 * 60
 INTERVAL_CHARGING = 5 * 60
 RETRY_NO_DONGLE = 60
+WAKE_REPLY = 3  # czekanie na odpowiedź przed ponowieniem (nowe zapytanie przerywa stare)
+WAKE_TRIES = 7  # ~20 s: mysz po głębokim śnie potrzebuje kilku sekund na odpowiedź
 ACTIVITY_WAIT = 30 * 60  # po tym czasie bez ruchu tylko odświeżamy plik stanu
 LOW_PCT = 15
 # (mV, %) krzywa rozładowania Li-Po pod obciążeniem; punkt 3750/64 zmierzony przez BT
@@ -43,8 +51,8 @@ STATE = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "z
 VERBOSE = "-v" in sys.argv
 
 
-def log(*a):
-    if VERBOSE:
+def log(*a, always=False):
+    if VERBOSE or always:
         print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
 
 
@@ -79,22 +87,27 @@ def percent_from_mv(mv):
     return 100
 
 
-def query(fd, timeout=1.0):
-    drain(fd)
-    os.write(fd, QUERY)
-    deadline = time.monotonic() + timeout
-    while (left := deadline - time.monotonic()) > 0:
-        if not select.select([fd], [], [], left)[0]:
-            break
-        d = os.read(fd, 64)
-        if len(d) >= 10 and d[0] == 0x05 and d[2:4] == b"\xfa\x48" and any(d[4:8]):
-            mv = int.from_bytes(d[4:6], "little") * 4
-            return {
-                "percent": percent_from_mv(mv),
-                "charging": bool(d[6]),
-                "mv": mv,
-                "raw": d.hex(),
-            }
+def query(fd, timeout=1.0, tries=1):
+    for n in range(1, tries + 1):
+        drain(fd)
+        os.write(fd, QUERY)
+        deadline = time.monotonic() + timeout
+        while (left := deadline - time.monotonic()) > 0:
+            if not select.select([fd], [], [], left)[0]:
+                break
+            d = os.read(fd, 64)
+            if len(d) >= 10 and d[0] == REPORT_ID and d[2:4] == b"\xfa\x48" and any(d[4:8]):
+                if n > 1:
+                    log(f"odpowiedź po {n} próbach", always=True)
+                mv = int.from_bytes(d[4:6], "little") * 4
+                return {
+                    "percent": percent_from_mv(mv),
+                    "charging": bool(d[6]),
+                    "mv": mv,
+                    "raw": d.hex(),
+                }
+    if tries > 1:
+        log(f"brak odpowiedzi po {tries} próbach", always=True)
     return None
 
 
@@ -133,13 +146,22 @@ def read_battery(wait=None):
     try:
         if wait is None:
             ready = list(fds)
+            timeout, tries = 1.0, 1
         else:
+            timeout, tries = WAKE_REPLY, WAKE_TRIES
             log("czekam na ruch myszy", *fds.values())
-            ready = select.select(list(fds), [], [], wait)[0]
-            if not ready:
-                return None, "idle", "brak ruchu"
+            deadline = time.monotonic() + wait
+            ready = []
+            # budzi tylko ruch: raport 0x05 (echo, status dongla) przychodzi też od uśpionej myszy
+            while not ready:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None, "idle", "brak ruchu"
+                for fd in select.select(list(fds), [], [], left)[0]:
+                    if os.read(fd, 64)[0] != REPORT_ID:
+                        ready.append(fd)
         for fd in ready:
-            if r := query(fd):
+            if r := query(fd, timeout, tries):
                 log("odpowiedź z", fds[fd])
                 return r, "ok", None
     except OSError as e:  # dongle albo kabel wyjęty w trakcie
@@ -162,10 +184,12 @@ def daemon():
         state = json.loads(STATE.read_text())
     except (OSError, ValueError):
         pass
-    # plik w /run znika przy restarcie: zapisujemy go od razu, bez budzenia myszy
-    state.update(online=False, charging=False, dongle=bool(find_hidraws()))
+    # plik w /run znika przy restarcie: zapisujemy go od razu, bez budzenia myszy;
+    # online zostaje z poprzedniego stanu (bez pliku widget pokaże „Brak odczytu”)
+    state.update(charging=False, dongle=bool(find_hidraws()))
     write_state(state)
     warned = False
+    misses = 0  # kolejne no_reply: ponowienia coraz rzadziej, żeby nie czytać ciągle strumienia ruchu
     while True:
         r, status, err = read_battery(wait=ACTIVITY_WAIT)
         state["checked"] = int(time.time())
@@ -179,11 +203,17 @@ def daemon():
                 notify(f"Zircon 660 Pro: {r['percent']}% — podłącz kabel.")
                 warned = True
             delay = INTERVAL_CHARGING if r["charging"] else INTERVAL
+            misses = 0
         else:
             log(err)
-            state.update(online=False, charging=False)
-            # idle od razu wraca do czekania na ruch; błędy dongla ponawiamy po minucie
-            delay = {"idle": 0, "no_reply": INTERVAL}.get(status, RETRY_NO_DONGLE)
+            if status == "no_reply":
+                # brak odpowiedzi poruszanej myszy to nie sen: stan zostaje, próba za 1, 2, 4… min
+                delay = min(RETRY_NO_DONGLE << misses, INTERVAL)
+                misses += 1
+            else:
+                state.update(online=False, charging=False)
+                # idle od razu wraca do czekania na ruch; błędy dongla ponawiamy po minucie
+                delay = 0 if status == "idle" else RETRY_NO_DONGLE
         write_state(state)
         time.sleep(delay)
 
