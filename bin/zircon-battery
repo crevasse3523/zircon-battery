@@ -17,8 +17,21 @@ Oszczędzanie baterii myszy i CPU:
   - zapytanie idzie tylko wtedy, gdy mysz i tak nadaje (po pierwszym raporcie ruchu),
     więc uśpiona mysz nigdy nie jest budzona;
   - czekanie na ruch to select() w jądrze: zero wybudzeń, dopóki mysz leży;
-  - hidraw jest zamykany zaraz po odczycie, a ciągły strumień ruchu (do 1000 Hz)
-    nie trafia do procesu; między odczytami demon śpi 15 min (5 min przy ładowaniu).
+  - ciągły strumień ruchu (do 1000 Hz) nie trafia do procesu: między odczytami
+    demon śpi 1 min z otwartym, ale nieczytanym hidraw (jądro kolejkuje do 64
+    raportów), a potem sprawdza tylko, czy w kolejce jest raport inny niż 0x05.
+    Tak nie ginie jednorazowy raport 01 00 00..., który mysz wysyła po wpięciu
+    ładowania (np. do portu monitora, który tylko ładuje), choć leży nieruszana.
+
+Ładowanie: mysz jest zasilana, więc demon pyta ją co CHARGING_POLL s bez czekania
+na ruch i odłączenie widać od razu. Napięcie pod ładowaniem jest zawyżone o ~90 mV
+(3700 -> 3790 mV po wpięciu), więc procent liczymy z mV - CHARGE_OFFSET_MV.
+Bez ładowania procent nie rośnie o szum ani przez relaksację napięcia po odłączeniu
+(tylko skok >= CHARGED_JUMP, np. po naładowaniu przy wyłączonym demonie).
+
+Wpięcie/wypięcie kabla (331a:5031) albo dongla demon widzi od razu ze zdarzeń udev
+(netlink, grupa udev: przychodzą już po nadaniu uprawnień do hidraw) i pyta mysz
+bez czekania na ruch, bo na kablu jest zasilana.
 
 Użycie:
   zircon-battery            demon, stan w $XDG_RUNTIME_DIR/zircon-battery.json
@@ -28,17 +41,25 @@ Użycie:
 import json
 import os
 import select
+import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 HID_IDS = ("0000331A:0000502E", "0000331A:00005031")  # dongle 2.4 GHz, kabel USB
+DEVPATH_IDS = (b"331A:502E", b"331A:5031")  # te same w DEVPATH zdarzeń udev
 QUERY = bytes([0x05, 0x24, 0xFA, 0x48]) + bytes(29)
 REPORT_ID = QUERY[0]
-INTERVAL = 15 * 60
-INTERVAL_CHARGING = 5 * 60
+INTERVAL = 60
+CHARGING_POLL = 10
+CHARGE_OFFSET_MV = 90  # zawyżenie napięcia przez ładowarkę (zmierzone)
+CHARGED_JUMP = 5  # wzrost % bez ładowania uznawany za realny (naładowana gdzie indziej)
 RETRY_NO_DONGLE = 60
+RETRY_MAX = 15 * 60
+HOTPLUG_SETTLE = 1  # dongle i kabel mają po kilka hidraw, zdarzenia przychodzą seriami
+NETLINK_KOBJECT_UEVENT = 15
+UDEV_GROUP = 2
 WAKE_REPLY = 3  # czekanie na odpowiedź przed ponowieniem (nowe zapytanie przerywa stare)
 WAKE_TRIES = 7  # ~20 s: mysz po głębokim śnie potrzebuje kilku sekund na odpowiedź
 ACTIVITY_WAIT = 30 * 60  # po tym czasie bez ruchu tylko odświeżamy plik stanu
@@ -73,6 +94,45 @@ def find_hidraws():
     return paths
 
 
+def open_uevents():
+    """Gniazdo zdarzeń udev albo None (wtedy kabel wykrywamy dopiero przy kolejnym odczycie)."""
+    try:
+        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, NETLINK_KOBJECT_UEVENT)
+        sock.bind((0, UDEV_GROUP))
+        return sock
+    except OSError as e:
+        log("brak zdarzeń udev:", e.strerror, always=True)
+        return None
+
+
+def hotplug(sock):
+    """Czy wśród zaległych zdarzeń jest dodanie/usunięcie hidraw myszy (czyta wszystkie)."""
+    hit = False
+    while select.select([sock], [], [], 0)[0]:
+        msg = sock.recv(16384)
+        if not msg.startswith(b"libudev\0"):
+            continue
+        # nagłówek libudev: przesunięcie bloku właściwości KEY=VALUE\0 pod bajtem 16
+        props = msg[int.from_bytes(msg[16:20], sys.byteorder):].split(b"\0")
+        if (b"SUBSYSTEM=hidraw" in props
+                and (b"ACTION=add" in props or b"ACTION=remove" in props)
+                and any(p.startswith(b"DEVPATH=") and any(i in p for i in DEVPATH_IDS) for p in props)):
+            hit = True
+    return hit
+
+
+def wait_hotplug(sock, delay):
+    """Śpi `delay` s; True, gdy wcześniej wpięto albo wypięto kabel lub dongle."""
+    if sock is None:
+        time.sleep(delay)
+        return False
+    deadline = time.monotonic() + delay
+    while (left := deadline - time.monotonic()) > 0:
+        if select.select([sock], [], [], left)[0] and hotplug(sock):
+            return True
+    return False
+
+
 def drain(fd):
     while select.select([fd], [], [], 0)[0]:
         os.read(fd, 64)
@@ -85,6 +145,22 @@ def percent_from_mv(mv):
         if mv <= v1:
             return round(p0 + (p1 - p0) * (mv - v0) / (v1 - v0))
     return 100
+
+
+def steady_percent(prev, was_charging, new, charging):
+    """Procent bez skoków przy wpięciu/wypięciu ładowania i bez szumu pod prąd.
+
+    Napięcie skacze o ~90 mV przy wpięciu i opada przez kilka minut po wypięciu, a
+    korekta CHARGE_OFFSET_MV działa tylko przy ładowaniu. Zmiana o >= CHARGED_JUMP
+    w „złą” stronę jest realna (np. stary stan z pliku po restarcie demona).
+    """
+    if prev is None:
+        return new
+    if charging:
+        return prev if prev - CHARGED_JUMP < new < prev else new
+    if was_charging:
+        return min(new, prev)
+    return prev if prev < new < prev + CHARGED_JUMP else new
 
 
 def query(fd, timeout=1.0, tries=1):
@@ -100,9 +176,10 @@ def query(fd, timeout=1.0, tries=1):
                 if n > 1:
                     log(f"odpowiedź po {n} próbach", always=True)
                 mv = int.from_bytes(d[4:6], "little") * 4
+                charging = bool(d[6])
                 return {
-                    "percent": percent_from_mv(mv),
-                    "charging": bool(d[6]),
+                    "percent": percent_from_mv(mv - CHARGE_OFFSET_MV if charging else mv),
+                    "charging": charging,
                     "mv": mv,
                     "raw": d.hex(),
                 }
@@ -125,12 +202,14 @@ def notify(text):
         pass
 
 
-def read_battery(wait=None):
+def read_battery(wait=None, idle=0, sock=None, tries=1):
     """Jeden odczyt: (wynik | None, status, błąd).
 
-    Status: ok, no_dongle, open_error, io_error, idle, no_reply. Z `wait` zapytanie
+    Status: ok, no_dongle, open_error, io_error, idle, no_reply, hotplug. Z `wait` zapytanie
     idzie dopiero po raporcie ruchu (przez urządzenie, które go zgłosiło), a bez ruchu
-    przez `wait` sekund wynikiem jest idle. Bez `wait` pytamy kolejno wszystkie.
+    przez `wait` sekund wynikiem jest idle; wcześniej demon śpi `idle` s z otwartym hidraw
+    i ruch zakolejkowany w tym czasie też się liczy. Zdarzenie udev na `sock` przerywa
+    sen i czekanie (hotplug). Bez `wait` pytamy kolejno wszystkie, każde `tries` razy.
     """
     paths = find_hidraws()
     if not paths:
@@ -146,19 +225,34 @@ def read_battery(wait=None):
     try:
         if wait is None:
             ready = list(fds)
-            timeout, tries = 1.0, 1
+            timeout = 1.0
         else:
             timeout, tries = WAKE_REPLY, WAKE_TRIES
-            log("czekam na ruch myszy", *fds.values())
-            deadline = time.monotonic() + wait
             ready = []
+            # sen bez czytania hidraw: jądro kolejkuje raporty, proces się nie budzi
+            if wait_hotplug(sock, idle):
+                return None, "hotplug", "zmiana urządzeń"
+            for fd in fds:
+                while select.select([fd], [], [], 0)[0]:
+                    if os.read(fd, 64)[0] != REPORT_ID and fd not in ready:
+                        ready.append(fd)
+            if ready:
+                log("ruch w czasie snu", *(fds[fd] for fd in ready))
+            else:
+                log("czekam na ruch myszy", *fds.values())
+            deadline = time.monotonic() + wait
+            watched = list(fds) + ([sock] if sock else [])
             # budzi tylko ruch: raport 0x05 (echo, status dongla) przychodzi też od uśpionej myszy
             while not ready:
                 left = deadline - time.monotonic()
                 if left <= 0:
                     return None, "idle", "brak ruchu"
-                for fd in select.select(list(fds), [], [], left)[0]:
-                    if os.read(fd, 64)[0] != REPORT_ID:
+                for fd in select.select(watched, [], [], left)[0]:
+                    if fd is sock:
+                        # po wpięciu kabla dongle milknie: nie czekamy na jego ruch
+                        if hotplug(sock):
+                            return None, "hotplug", "zmiana urządzeń"
+                    elif os.read(fd, 64)[0] != REPORT_ID:
                         ready.append(fd)
         for fd in ready:
             if r := query(fd, timeout, tries):
@@ -188,34 +282,59 @@ def daemon():
     # online zostaje z poprzedniego stanu (bez pliku widget pokaże „Brak odczytu”)
     state.update(charging=False, dongle=bool(find_hidraws()))
     write_state(state)
+    sock = open_uevents()
     warned = False
     misses = 0  # kolejne no_reply: ponowienia coraz rzadziej, żeby nie czytać ciągle strumienia ruchu
+    plugged = False  # wpięto/wypięto kabel lub dongle: pytamy od razu, bez czekania na ruch
+    idle = 0  # sen z otwartym hidraw przed czekaniem na ruch (po udanym odczycie bez ładowania)
     while True:
-        r, status, err = read_battery(wait=ACTIVITY_WAIT)
+        immediate = plugged or state["charging"]
+        if plugged:
+            time.sleep(HOTPLUG_SETTLE)
+            hotplug(sock)  # reszta serii zdarzeń z tego samego wpięcia
+            log("zmiana urządzeń, pytam od razu")
+        if immediate:
+            r, status, err = read_battery(tries=2)
+        else:
+            r, status, err = read_battery(wait=ACTIVITY_WAIT, idle=idle, sock=sock)
+        idle = 0
+        if status == "hotplug":
+            plugged = True
+            continue
         state["checked"] = int(time.time())
         state["dongle"] = status not in ("no_dongle", "io_error")
         if r:
             log("odczyt", r)
+            r["percent"] = steady_percent(state.get("percent"), state["charging"],
+                                          r["percent"], r["charging"])
             state.update(r, online=True, ts=state["checked"])
             if r["charging"] or r["percent"] > LOW_PCT + 5:
                 warned = False
             elif r["percent"] <= LOW_PCT and not warned:
                 notify(f"Zircon 660 Pro: {r['percent']}% — podłącz kabel.")
                 warned = True
-            delay = INTERVAL_CHARGING if r["charging"] else INTERVAL
+            if r["charging"]:
+                delay = CHARGING_POLL
+            else:
+                delay, idle = 0, INTERVAL
             misses = 0
         else:
             log(err)
-            if status == "no_reply":
+            if status == "no_reply" and immediate:
+                # odłączona od ładowania albo po wypięciu kabla łączy się jeszcze z donglem:
+                # odczyt przy pierwszym ruchu
+                state["charging"] = False
+                delay = 0
+            elif status == "no_reply":
                 # brak odpowiedzi poruszanej myszy to nie sen: stan zostaje, próba za 1, 2, 4… min
-                delay = min(RETRY_NO_DONGLE << misses, INTERVAL)
+                delay = min(RETRY_NO_DONGLE << misses, RETRY_MAX)
                 misses += 1
             else:
                 state.update(online=False, charging=False)
                 # idle od razu wraca do czekania na ruch; błędy dongla ponawiamy po minucie
                 delay = 0 if status == "idle" else RETRY_NO_DONGLE
         write_state(state)
-        time.sleep(delay)
+        plugged = wait_hotplug(sock, delay)
 
 
 if __name__ == "__main__":

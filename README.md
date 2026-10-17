@@ -27,7 +27,13 @@ Mysz po 2.4 GHz nie podaje procentu, tylko napięcie. Demon przelicza je krzywą
 
 - Zapytanie idzie tylko po wykryciu ruchu myszy, więc uśpiona mysz nie jest budzona.
 - Czekanie na ruch to `select()` w jądrze, bez wybudzeń procesu.
-- Hidraw jest zamykany zaraz po odczycie. Między odczytami demon śpi 15 min, a przy ładowaniu 5 min.
+- Między odczytami demon śpi 1 min z otwartym, ale nieczytanym hidraw. Jądro kolejkuje raporty, więc strumień ruchu nie budzi procesu, a raport wysyłany przez nieruszaną mysz po wpięciu ładowania nie ginie.
+- W trakcie ładowania mysz jest zasilana, więc demon pyta ją co 10 s bez czekania na ruch. Odłączenie ładowania widać w kilka sekund.
+- Wpięcie albo wypięcie kabla do tego komputera (lub dongla) demon widzi od razu ze zdarzeń udev. Ładowanie z portu, który tylko zasila (monitor, powerbank, ładowarka), widać najpóźniej po ~1 min.
+
+## Procent
+
+Napięcie pod ładowaniem jest zawyżone o ~90 mV, więc w trakcie ładowania procent liczony jest z napięcia pomniejszonego o tę wartość. Bez ładowania procent nie rośnie od szumu ani od relaksacji napięcia po odłączeniu kabla (wyjątek: skok o ≥ 5 pp, np. mysz naładowana przy wyłączonym demonie).
 - Raz wysyła powiadomienie przy ≤ 15%.
 - Po 30 min bez ruchu mysz jest oznaczana jako uśpiona (widget pokazuje ostatni znany procent).
 

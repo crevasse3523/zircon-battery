@@ -50,7 +50,7 @@ PlasmoidItem {
     Plasma5Support.DataSource {
         engine: "executable"
         connectedSources: [root.stateCommand]
-        interval: 60000
+        interval: 5000
         onNewData: function(sourceName, data) {
             if (Number(data["exit code"]) !== 0) {
                 root.batt = {}
